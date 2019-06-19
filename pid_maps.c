@@ -8,22 +8,68 @@
 #include <uapi/linux/stat.h> /* S_IRUSR etc */
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/slab.h> /* kzalloc */
 #include <linux/sched/mm.h>
+#include <linux/list.h>
+#include <linux/uaccess.h> /* copy_from_user */
 
 MODULE_LICENSE("GPL");
 
-static struct dentry *debugfs_dir = NULL;
-static struct dentry *debugfs_ctrl_file = NULL;
-
+static struct dentry *debugfs_root_dir = NULL;
+static struct dentry *debugfs_pid_add_file = NULL;
+static struct dentry *debugfs_pid_del_file = NULL;
+static LIST_HEAD(priv_list_head);
+pid_t last_pid_nr_added = 0;
 
 struct pid_maps_private {
-	struct inode *inode;
 	pid_t pid_nr;
 	struct pid *pid_struct;
+	struct dentry *debugfs_pid_dir;
+	struct inode *inode;
 	struct task_struct *task;
 	struct mm_struct *mm;
 	struct vm_area_struct *tail_vma;
+	void *addr;
+	struct list_head priv_list_node;
 } __randomize_layout;
+
+static struct pid_maps_private *pid_maps_private_data_alloc(
+	pid_t pid_nr,
+	struct pid *pid_struct)
+{
+	struct pid_maps_private *priv;
+
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL_ACCOUNT);
+	priv->pid_nr = pid_nr;
+	priv->pid_struct = pid_struct;
+	list_add_tail(&priv->priv_list_node, &priv_list_head);
+
+	return priv;
+}
+
+static void pid_maps_private_data_free(struct pid_maps_private *priv)
+{
+	if (priv->debugfs_pid_dir) {
+		printk(KERN_ERR "[pid_maps] debugfs_remove_recursive entry  pid: %d\n", priv->pid_nr);
+		debugfs_remove_recursive(priv->debugfs_pid_dir);
+		printk(KERN_ERR "[pid_maps] debugfs_remove_recursive exit  pid: %d\n", priv->pid_nr);
+	}
+
+	list_del(&priv->priv_list_node);
+	memset(priv, 0, sizeof(*priv));
+	kfree(priv);
+}
+
+static struct pid_maps_private *pid_maps_private_data_search(pid_t pid_nr)
+{
+	struct pid_maps_private *priv;
+
+	list_for_each_entry(priv, &priv_list_head, priv_list_node) {
+		if (priv->pid_nr == pid_nr)
+			return priv;
+	}
+	return NULL;
+}
 
 static struct mm_struct *_mm_access_start(struct pid_maps_private *priv)
 {
@@ -203,7 +249,7 @@ static void show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 		}
 
 		if (vma->vm_start <= mm->brk &&
-		    vma->vm_end >= mm->start_brk) {
+			vma->vm_end >= mm->start_brk) {
 			name = "[heap]";
 			goto done;
 		}
@@ -234,53 +280,77 @@ static const struct seq_operations pid_maps_seq_ops = {
 	.show	= show_map
 };
 
+static inline void seq_set_private(struct file *file, void *private)
+{
+	struct seq_file *seq = file->private_data;
+	seq->private = private;
+}
+
+static inline void *seq_get_private(struct file *file)
+{
+	struct seq_file *seq = file->private_data;
+	return seq->private;
+}
+
 static int pid_maps_release(struct inode *inode, struct file *file);
 
 static int pid_maps_fopen(struct inode *inode, struct file *file)
 {
-	pid_t pid_nr = (pid_t)(u64)inode->i_private;
+	struct pid_maps_private *priv = inode->i_private;
+	pid_t pid_nr = priv->pid_nr;
 	struct pid *pid_struct;
 	struct task_struct *task;
-	struct pid_maps_private *priv;
+	int rc;
 
 	pid_struct = find_get_pid(pid_nr);
 	if (IS_ERR_OR_NULL(pid_struct)) {
-		printk(KERN_ERR "[pid_maps] pid not found: %d\n", pid_nr);
-		return PTR_ERR(pid_struct);
+		priv->pid_struct = NULL;
+		printk(KERN_ERR "[pid_maps] maps_fopen, pid not found: %d\n", pid_nr);
+		return -EINVAL;
+	}
+	if (pid_struct != priv->pid_struct) {
+		printk(KERN_ERR "[pid_maps] maps_fopen, pid struct do not match: %d\n", pid_nr);
+		return -EINVAL;
 	}
 
 	task = pid_task(pid_struct, PIDTYPE_PID);
 	if (IS_ERR_OR_NULL(task)) {
-		printk(KERN_ERR "[pid_maps] pid_task failed, pid: m%d\n", pid_nr);
+		printk(KERN_ERR "[pid_maps] maps_fopen, pid_task failed, pid: m%d\n", pid_nr);
 		return PTR_ERR(task);
 	}
 	printk(KERN_INFO "[pid_maps] map pid: %d cmd: %s\n", pid_nr, task->comm);
 
-	priv = __seq_open_private(file, &pid_maps_seq_ops,
-				  sizeof(struct pid_maps_private));
-	if (!priv)
-		return -ENOMEM;
-
 	priv->inode = inode;
-	priv->pid_nr = pid_nr;
-	priv->pid_struct = pid_struct;
 	priv->task = task;
 	priv->mm = get_task_mm(task);
 	if (IS_ERR(priv->mm)) {
 		int err = PTR_ERR(priv->mm);
+		printk(KERN_ERR "[pid_maps] get_task_mm failed, pid: m%d\n", pid_nr);
 		pid_maps_release(inode, file);
 		return err;
 	}
+
+	rc = seq_open(file, &pid_maps_seq_ops);
+	if (rc < 0) {
+		printk(KERN_ERR "[pid_maps] seq_open failed, pid: m%d\n", pid_nr);
+		pid_maps_release(inode, file);
+		return rc;
+	}
+	seq_set_private(file, priv);
 
 	return 0;
 }
 
 static int pid_maps_release(struct inode *inode, struct file *file)
 {
-	struct seq_file *seq = file->private_data;
-	struct pid_maps_private *priv = seq->private;
+	struct pid_maps_private *priv = seq_get_private(file);
 
-	printk(KERN_INFO "[pid_maps] map done pid: %d\n", priv->pid_nr);
+	if (IS_ERR_OR_NULL(priv->pid_struct)) {
+		printk(KERN_ERR "[pid_maps] skip maps release pid: %d\n", priv->pid_nr);
+		return 0;
+	}
+
+	printk(KERN_INFO "[pid_maps] maps release pid: %d\n", priv->pid_nr);
 
 	if (priv->mm)
 		mmput(priv->mm);
@@ -288,7 +358,7 @@ static int pid_maps_release(struct inode *inode, struct file *file)
 	if (priv->pid_struct)
 		put_pid(priv->pid_struct);
 
-	return seq_release_private(inode, file);
+	return seq_release(inode, file);
 }
 
 static const struct file_operations pid_maps_fops = {
@@ -299,11 +369,64 @@ static const struct file_operations pid_maps_fops = {
 	.release = pid_maps_release,
 };
 
-static int debugfs_pid_write(void *data, u64 val)
+static int debugfs_pid_addr_in(void *data, u64 val)
+{
+	struct pid_maps_private *priv = data;
+
+	if (!IS_ERR_OR_NULL(priv)) {
+		priv->addr = (void *)val;
+		printk(KERN_INFO "[pid_maps] addr_in, pid: %d addr: 0x%016llx\n", priv->pid_nr, (u64)priv->addr);
+	} else {
+		printk(KERN_ERR "[pid_maps] addr_in, priv: NULL\n");
+	}
+
+	return 0;
+}
+static int debugfs_pid_addr_out(void *data, u64 *val)
+{
+	struct pid_maps_private *priv = data;
+	if (!IS_ERR_OR_NULL(priv)) {
+		printk(KERN_INFO "[pid_maps] addr out, pid: %d addr: 0x%016llx\n", priv->pid_nr, (u64)priv->addr);
+		*val = (u64)priv->addr;
+	} else {
+		*val = 0;
+		printk(KERN_ERR "[pid_maps] addr_out, priv: NULL\n");
+	}
+
+	return 0;
+}
+DEFINE_SIMPLE_ATTRIBUTE(pid_addr_fops, debugfs_pid_addr_out, debugfs_pid_addr_in, "0x%016llx\n");
+
+static int debugfs_pid_u64_out(void *data, u64 *val)
+{
+	struct pid_maps_private *priv = data;
+	if (!IS_ERR_OR_NULL(priv)) {
+		u64 *p64 = (u64 *)priv->addr;
+		if (!IS_ERR_OR_NULL(p64)) {
+			copy_from_user(val, p64, sizeof(u64));
+			printk(KERN_INFO "[pid_maps] u64_out, pid: %d p64: 0x%016llx val: 0x%016llx\n", priv->pid_nr, (u64)p64, *val);
+		} else {
+			*val = 0;
+			printk(KERN_ERR "[pid_maps] u64_out, pid: %d p64: NULL\n", priv->pid_nr);
+		}
+	} else {
+		*val = 0;
+		printk(KERN_ERR "[pid_maps] u64_out, priv: NULL\n");
+	}
+
+	return 0;
+}
+DEFINE_SIMPLE_ATTRIBUTE(pid_u64_fops, debugfs_pid_u64_out, NULL, "0x%016llx\n");
+
+static int debugfs_pid_add_in(void *data, u64 val)
 {
 	pid_t pid_nr = (pid_t)val;
+	int err = 0;
 	struct pid *pid_struct;
-	static struct dentry *debugfs_pid_maps_file;
+	struct pid_maps_private *priv;
+	struct dentry *debugfs_pid_maps_file;
+	struct dentry *debugfs_pid_addr_file;
+	struct dentry *debugfs_pid_u64_file;
 	char pid_str[8];
 
 	printk(KERN_INFO "[pid_maps] pid: %d\n", pid_nr);
@@ -311,36 +434,115 @@ static int debugfs_pid_write(void *data, u64 val)
 	pid_struct = find_vpid(pid_nr);
 	if (!pid_struct) {
 		printk(KERN_ERR "[pid_maps] failed to find pid: %d\n", pid_nr);
-		return -EINVAL;
+		err = -EINVAL;
+		goto out;
+	}
+
+	priv = pid_maps_private_data_alloc(pid_nr, pid_struct);
+	if (!priv) {
+		printk(KERN_ERR "[pid_maps] failed to alloc private data, pid: %d\n", pid_nr);
+		err = -ENOMEM;
+		goto out;
 	}
 
 	snprintf(pid_str, sizeof(pid_str), "%d", pid_nr);
-	debugfs_pid_maps_file = debugfs_create_file(
-			pid_str, /* name */
-			S_IRUSR | S_IRGRP | S_IROTH, /* read only */
-			debugfs_dir, /* parent entry */
-			(void *)val, /* data */
-			&pid_maps_fops);
-	if (!debugfs_pid_maps_file)
-		return -EINVAL;
+	priv->debugfs_pid_dir = debugfs_create_dir(pid_str, debugfs_root_dir);
+	if (!priv->debugfs_pid_dir) {
+		printk(KERN_ERR "[pid_maps] failed to create debugs dir, pid: %d\n", pid_nr);
+		err = -EIO;
+		goto out_free_priv;
+	}
 
+	debugfs_pid_maps_file = debugfs_create_file(
+			"maps", /* name */
+			S_IRUSR | S_IRGRP | S_IROTH, /* read only */
+			priv->debugfs_pid_dir, /* parent entry */
+			(void *)priv, /* data */
+			&pid_maps_fops);
+	if (!debugfs_pid_maps_file) {
+		printk(KERN_ERR "[pid_maps] failed to create debugs map entry, pid: %d\n", pid_nr);
+		err = -EIO;
+		goto out_free_priv;
+	}
+
+	debugfs_pid_addr_file = debugfs_create_file(
+			"addr", /* name */
+			S_IWUSR | S_IWGRP | S_IWOTH, /* write only */
+			priv->debugfs_pid_dir, /* parent entry */
+			(void *)priv, /* data */
+			&pid_addr_fops);
+	if (!debugfs_pid_addr_file) {
+		printk(KERN_ERR "[pid_maps] failed to create debugs addr entry, pid: %d\n", pid_nr);
+		err = -EIO;
+		goto out_free_priv;
+	}
+
+	debugfs_pid_u64_file = debugfs_create_file(
+			"u64", /* name */
+			S_IWUSR | S_IWGRP | S_IWOTH, /* write only */
+			priv->debugfs_pid_dir, /* parent entry */
+			(void *)priv, /* data */
+			&pid_u64_fops);
+	if (!debugfs_pid_u64_file) {
+		printk(KERN_ERR "[pid_maps] failed to create debugs u64 entry, pid: %d\n", pid_nr);
+		err = -EIO;
+		goto out_free_priv;
+	}
+
+	last_pid_nr_added = pid_nr;
+	goto out;
+
+out_free_priv:
+	pid_maps_private_data_free(priv);
+out:
+	return err;
+}
+
+static int debugfs_pid_add_out_last(void *data, u64 *val)
+{
+	*val = (u64)last_pid_nr_added;
 	return 0;
 }
-DEFINE_SIMPLE_ATTRIBUTE(pid_fops, NULL, debugfs_pid_write, "%llu\n");
+DEFINE_SIMPLE_ATTRIBUTE(pid_add_fops, debugfs_pid_add_out_last, debugfs_pid_add_in, "%llu\n");
+
+static int debugfs_pid_del_in(void *data, u64 val)
+{
+	pid_t pid_nr = (pid_t)val;
+	struct pid_maps_private *priv;
+
+	priv = pid_maps_private_data_search(pid_nr);
+	if (priv == NULL) {
+		printk(KERN_INFO "[pid_maps] pid_del, pid not found: %dn", pid_nr);
+		return -EINVAL;
+	}
+
+	pid_maps_private_data_free(priv);
+	return 0;
+}
+DEFINE_SIMPLE_ATTRIBUTE(pid_del_fops, NULL, debugfs_pid_del_in, "%llu\n");
 
 static int pid_maps_init(void)
 {
-	debugfs_dir = debugfs_create_dir("pid_maps", NULL);
-	if (!debugfs_dir)
+	debugfs_root_dir = debugfs_create_dir("pid_maps", NULL);
+	if (!debugfs_root_dir)
 		return -EINVAL;
 
-	debugfs_ctrl_file = debugfs_create_file(
-		"pid",
+	debugfs_pid_add_file = debugfs_create_file(
+		"pid_add",
 		S_IWUSR | S_IWGRP | S_IWOTH, /* write only */
-		debugfs_dir,
+		debugfs_root_dir,
 		NULL, /* no data */
-		&pid_fops);
-	if (!debugfs_ctrl_file)
+		&pid_add_fops);
+	if (!debugfs_pid_add_file)
+		return -EINVAL;
+
+	debugfs_pid_del_file = debugfs_create_file(
+		"pid_del",
+		S_IWUSR | S_IWGRP | S_IWOTH, /* write only */
+		debugfs_root_dir,
+		NULL, /* no data */
+		&pid_del_fops);
+	if (!debugfs_pid_del_file)
 		return -EINVAL;
 
 	printk(KERN_INFO "[pid_maps] entry\n");
@@ -351,7 +553,7 @@ static void pid_maps_exit(void)
 {
 	printk(KERN_INFO "[pid_maps] exit\n");
 
-	debugfs_remove_recursive(debugfs_dir);
+	debugfs_remove_recursive(debugfs_root_dir);
 }
 
 module_init(pid_maps_init)
