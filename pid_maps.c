@@ -418,9 +418,8 @@ static int debugfs_pid_u64_out(void *data, u64 *val)
 }
 DEFINE_SIMPLE_ATTRIBUTE(pid_u64_fops, debugfs_pid_u64_out, NULL, "0x%016llx\n");
 
-static int debugfs_pid_add_in(void *data, u64 val)
+int pid_map_create(pid_t pid_nr)
 {
-	pid_t pid_nr = (pid_t)val;
 	int err = 0;
 	struct pid *pid_struct;
 	struct pid_maps_private *priv;
@@ -497,7 +496,43 @@ out_free_priv:
 out:
 	return err;
 }
+EXPORT_SYMBOL(pid_map_create);
 
+int pid_map_update(pid_t pid_nr)
+{
+	struct pid_maps_private *priv;
+
+	priv = pid_maps_private_data_search(pid_nr);
+	if (priv == NULL) {
+		printk(KERN_ERR "[pid_maps] pid_update, pid not found: %dn", pid_nr);
+		return -EINVAL;
+	}
+
+	printk(KERN_INFO "[pid_maps] pid_update, pid: %dn", pid_nr);
+	return 0;
+}
+EXPORT_SYMBOL(pid_map_update);
+
+int pid_map_delete(pid_t pid_nr)
+{
+	struct pid_maps_private *priv;
+
+	priv = pid_maps_private_data_search(pid_nr);
+	if (priv == NULL) {
+		printk(KERN_ERR "[pid_maps] pid_del, pid not found: %dn", pid_nr);
+		return -EINVAL;
+	}
+
+	pid_maps_private_data_free(priv);
+	return 0;
+}
+EXPORT_SYMBOL(pid_map_delete);
+
+static int debugfs_pid_add_in(void *data, u64 val)
+{
+	pid_t pid_nr = (pid_t)val;
+	return pid_map_create(pid_nr);
+}
 static int debugfs_pid_add_out_last(void *data, u64 *val)
 {
 	*val = (u64)last_pid_nr_added;
@@ -508,16 +543,7 @@ DEFINE_SIMPLE_ATTRIBUTE(pid_add_fops, debugfs_pid_add_out_last, debugfs_pid_add_
 static int debugfs_pid_del_in(void *data, u64 val)
 {
 	pid_t pid_nr = (pid_t)val;
-	struct pid_maps_private *priv;
-
-	priv = pid_maps_private_data_search(pid_nr);
-	if (priv == NULL) {
-		printk(KERN_INFO "[pid_maps] pid_del, pid not found: %dn", pid_nr);
-		return -EINVAL;
-	}
-
-	pid_maps_private_data_free(priv);
-	return 0;
+	return pid_map_delete(pid_nr);
 }
 DEFINE_SIMPLE_ATTRIBUTE(pid_del_fops, NULL, debugfs_pid_del_in, "%llu\n");
 
